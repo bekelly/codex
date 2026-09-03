@@ -507,7 +507,7 @@ async fn run_command_under_windows_session(
     let spawned = match spawned {
         Ok(spawned) => spawned,
         Err(err) => {
-            eprintln!("windows sandbox failed: {err}");
+            eprintln!("windows sandbox failed: {err:#}");
             std::process::exit(1);
         }
     };

@@ -1,6 +1,8 @@
 use super::DesktopPolicy;
 use super::LaunchDesktop;
 use super::PRIVATE_DESKTOP_PREFIX;
+use super::current_window_station_name;
+use super::qualify_desktop_name;
 use super::shared_private_desktop_for_user;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::setup::SandboxSetupRequest;
@@ -24,6 +26,21 @@ use windows_sys::Win32::NetworkManagement::NetManagement::DNLEN;
 use windows_sys::Win32::NetworkManagement::NetManagement::UNLEN;
 use windows_sys::Win32::Security::Authentication::Identity::GetUserNameExW;
 use windows_sys::Win32::Security::Authentication::Identity::NameSamCompatible;
+
+#[test]
+fn qualifies_private_desktop_for_interactive_window_station() {
+    assert_eq!(
+        qualify_desktop_name("WinSta0", "CodexSandboxDesktop-abcd"),
+        r"WinSta0\CodexSandboxDesktop-abcd",
+    );
+}
+
+#[test]
+fn qualifies_private_desktop_for_service_window_station_without_winsta0_assumption() {
+    let qualified = qualify_desktop_name("Service-0x2-8e59a15c$", "CodexSandboxDesktop-abcd");
+    assert_eq!(qualified, r"Service-0x2-8e59a15c$\CodexSandboxDesktop-abcd",);
+    assert!(!qualified.starts_with(r"WinSta0\"));
+}
 
 #[test]
 fn private_desktop_rejects_interactive_and_injected_names() {
@@ -76,7 +93,12 @@ fn shared_desktop_survives_launch_handles_and_concurrent_requests() -> Result<()
     })?;
     let name = names[0].clone();
     assert_eq!(names, vec![name.clone(); 4]);
-    drop(LaunchDesktop::open_private(&name)?);
+    let launch_desktop = LaunchDesktop::open_private(&name)?;
+    assert_eq!(
+        launch_desktop.startup_info_desktop_name(),
+        qualify_desktop_name(&current_window_station_name()?, &name),
+    );
+    drop(launch_desktop);
     assert_eq!(
         shared_private_desktop_for_user(
             &account.to_ascii_lowercase(),
