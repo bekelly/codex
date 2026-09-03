@@ -45,6 +45,7 @@ const WRITE_RESTRICTED: u32 = 0x08;
 const GENERIC_ALL: u32 = 0x1000_0000;
 const WIN_WORLD_SID: i32 = 1;
 const SE_GROUP_LOGON_ID: u32 = 0xC0000000;
+const SE_GROUP_ENABLED: u32 = 0x00000004;
 
 #[repr(C)]
 struct TokenDefaultDaclInfo {
@@ -191,50 +192,52 @@ pub unsafe fn get_current_token_for_restriction() -> Result<HANDLE> {
     Ok(h)
 }
 
-pub unsafe fn get_logon_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>> {
-    unsafe fn scan_token_groups_for_logon(h: HANDLE) -> Option<Vec<u8>> {
-        let mut needed: u32 = 0;
-        GetTokenInformation(h, TokenGroups, std::ptr::null_mut(), 0, &mut needed);
-        if needed == 0 {
-            return None;
-        }
-        let mut buf: Vec<u8> = vec![0u8; needed as usize];
-        let ok = GetTokenInformation(
-            h,
-            TokenGroups,
-            buf.as_mut_ptr() as *mut c_void,
-            needed,
-            &mut needed,
-        );
-        if ok == 0 || (needed as usize) < std::mem::size_of::<u32>() {
-            return None;
-        }
-        let group_count = std::ptr::read_unaligned(buf.as_ptr() as *const u32) as usize;
-        // TOKEN_GROUPS layout is: DWORD GroupCount; SID_AND_ATTRIBUTES Groups[];
-        // On 64-bit, Groups is aligned to pointer alignment after 4-byte GroupCount.
-        let after_count = unsafe { buf.as_ptr().add(std::mem::size_of::<u32>()) } as usize;
-        let align = std::mem::align_of::<SID_AND_ATTRIBUTES>();
-        let aligned = (after_count + (align - 1)) & !(align - 1);
-        let groups_ptr = aligned as *const SID_AND_ATTRIBUTES;
-        for i in 0..group_count {
-            let entry: SID_AND_ATTRIBUTES = std::ptr::read_unaligned(groups_ptr.add(i));
-            if (entry.Attributes & SE_GROUP_LOGON_ID) == SE_GROUP_LOGON_ID {
-                let sid = entry.Sid;
-                let sid_len = GetLengthSid(sid);
-                if sid_len == 0 {
-                    return None;
-                }
-                let mut out = vec![0u8; sid_len as usize];
-                if CopySid(sid_len, out.as_mut_ptr() as *mut c_void, sid) == 0 {
-                    return None;
-                }
-                return Some(out);
-            }
-        }
-        None
+unsafe fn scan_token_groups_for_logon(h: HANDLE, require_enabled: bool) -> Option<Vec<u8>> {
+    let mut needed: u32 = 0;
+    GetTokenInformation(h, TokenGroups, std::ptr::null_mut(), 0, &mut needed);
+    if needed == 0 {
+        return None;
     }
+    let mut buf: Vec<u8> = vec![0u8; needed as usize];
+    let ok = GetTokenInformation(
+        h,
+        TokenGroups,
+        buf.as_mut_ptr() as *mut c_void,
+        needed,
+        &mut needed,
+    );
+    if ok == 0 || (needed as usize) < std::mem::size_of::<u32>() {
+        return None;
+    }
+    let group_count = std::ptr::read_unaligned(buf.as_ptr() as *const u32) as usize;
+    // TOKEN_GROUPS layout is: DWORD GroupCount; SID_AND_ATTRIBUTES Groups[];
+    // On 64-bit, Groups is aligned to pointer alignment after 4-byte GroupCount.
+    let after_count = unsafe { buf.as_ptr().add(std::mem::size_of::<u32>()) } as usize;
+    let align = std::mem::align_of::<SID_AND_ATTRIBUTES>();
+    let aligned = (after_count + (align - 1)) & !(align - 1);
+    let groups_ptr = aligned as *const SID_AND_ATTRIBUTES;
+    for i in 0..group_count {
+        let entry: SID_AND_ATTRIBUTES = std::ptr::read_unaligned(groups_ptr.add(i));
+        if (entry.Attributes & SE_GROUP_LOGON_ID) == SE_GROUP_LOGON_ID
+            && (!require_enabled || entry.Attributes & SE_GROUP_ENABLED != 0)
+        {
+            let sid = entry.Sid;
+            let sid_len = GetLengthSid(sid);
+            if sid_len == 0 {
+                return None;
+            }
+            let mut out = vec![0u8; sid_len as usize];
+            if CopySid(sid_len, out.as_mut_ptr() as *mut c_void, sid) == 0 {
+                return None;
+            }
+            return Some(out);
+        }
+    }
+    None
+}
 
-    if let Some(v) = scan_token_groups_for_logon(h_token) {
+pub unsafe fn get_logon_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>> {
+    if let Some(v) = scan_token_groups_for_logon(h_token, false) {
         return Ok(v);
     }
 
@@ -264,7 +267,7 @@ pub unsafe fn get_logon_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>> {
             let lt: TOKEN_LINKED_TOKEN =
                 std::ptr::read_unaligned(ln_buf.as_ptr() as *const TOKEN_LINKED_TOKEN);
             if lt.linked_token != 0 {
-                let res = scan_token_groups_for_logon(lt.linked_token);
+                let res = scan_token_groups_for_logon(lt.linked_token, false);
                 CloseHandle(lt.linked_token);
                 if let Some(v) = res {
                     return Ok(v);
@@ -274,6 +277,15 @@ pub unsafe fn get_logon_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>> {
     }
 
     Err(anyhow!("Logon SID not present on token"))
+}
+
+/// Returns the enabled logon SID directly present on `h_token`.
+///
+/// Unlike [`get_logon_sid_bytes`], this does not inspect a linked token: callers that use this
+/// for window-object ACLs need the SID that is enabled on the exact primary token being launched.
+pub(crate) unsafe fn get_enabled_logon_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>> {
+    scan_token_groups_for_logon(h_token, true)
+        .ok_or_else(|| anyhow!("enabled logon SID not present on token"))
 }
 
 pub(crate) unsafe fn get_user_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>> {

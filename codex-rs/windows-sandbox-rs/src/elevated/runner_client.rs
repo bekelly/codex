@@ -1,5 +1,6 @@
 use crate::desktop::DesktopPolicy;
 use crate::desktop::shared_private_desktop_for_user;
+use crate::desktop_bootstrap::RunnerDesktopBootstrapAccess;
 use crate::identity::SandboxCreds;
 use crate::ipc_framed::ErrorPayload;
 use crate::ipc_framed::ErrorStage;
@@ -9,12 +10,13 @@ use crate::ipc_framed::Message;
 use crate::ipc_framed::SpawnRequest;
 use crate::ipc_framed::read_frame;
 use crate::ipc_framed::write_frame;
+use crate::logging;
 use crate::runner_pipe::PIPE_ACCESS_INBOUND;
 use crate::runner_pipe::PIPE_ACCESS_OUTBOUND;
 use crate::runner_pipe::connect_pipe;
 use crate::runner_pipe::create_named_pipe;
 use crate::runner_pipe::find_runner_exe;
-use crate::runner_pipe::pipe_pair;
+use crate::runner_pipe::pipe_set;
 use crate::winutil::quote_windows_arg;
 use crate::winutil::to_wide;
 use anyhow::Context;
@@ -40,10 +42,15 @@ use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode;
 use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
 use windows_sys::Win32::System::Threading::CreateProcessWithLogonW;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::GetCurrentThread;
+use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
+use windows_sys::Win32::System::Threading::ResumeThread;
 use windows_sys::Win32::System::Threading::STARTUPINFOW;
 use windows_sys::Win32::System::Threading::TerminateProcess;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
@@ -51,8 +58,29 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 const RUNNER_SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const RUNNER_PIPE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const RUNNER_SPAWN_READY_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const RUNNER_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const RUNNER_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNNER_ERROR_MODE_FLAGS: u32 = 0x0001 | 0x0002;
 const WAIT_OBJECT_0: u32 = 0;
+const WAIT_TIMEOUT: u32 = 0x0000_0102;
+
+fn runner_startup_diagnostic(message: &str, log_dir: Option<&Path>) {
+    logging::log_note(&format!("RUNNER STARTUP: {message}"), log_dir);
+}
+
+fn runner_exit_code(process: HANDLE) -> Result<u32> {
+    let mut exit_code = 0u32;
+    if unsafe { GetExitCodeProcess(process, &mut exit_code) } == 0 {
+        anyhow::bail!("GetExitCodeProcess failed for runner: {}", unsafe {
+            GetLastError()
+        });
+    }
+    Ok(exit_code)
+}
+
+fn format_exit_code(exit_code: u32) -> String {
+    format!("0x{exit_code:08X} ({exit_code})")
+}
 
 #[derive(Debug)]
 struct RunnerLogonError {
@@ -94,9 +122,199 @@ impl std::fmt::Display for RunnerStartupError {
 
 impl std::error::Error for RunnerStartupError {}
 
+struct OwnedWinHandle(HANDLE);
+
+impl OwnedWinHandle {
+    fn new(handle: HANDLE) -> Self {
+        Self(handle)
+    }
+
+    fn get(&self) -> HANDLE {
+        self.0
+    }
+
+    fn into_raw(mut self) -> HANDLE {
+        let handle = self.0;
+        self.0 = 0;
+        handle
+    }
+}
+
+impl Drop for OwnedWinHandle {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+/// Owns a newly created runner until its process and desktop access move into `RunnerLifetime`.
+/// Any earlier error path terminates the process before closing its handles.
+struct PendingRunner {
+    process: OwnedWinHandle,
+    thread: Option<OwnedWinHandle>,
+    pid: u32,
+    terminate_on_drop: bool,
+    log_dir: Option<std::path::PathBuf>,
+}
+
+impl PendingRunner {
+    fn new(process_information: PROCESS_INFORMATION, log_dir: Option<&Path>) -> Self {
+        Self {
+            process: OwnedWinHandle::new(process_information.hProcess),
+            thread: Some(OwnedWinHandle::new(process_information.hThread)),
+            pid: process_information.dwProcessId,
+            terminate_on_drop: true,
+            log_dir: log_dir.map(Path::to_path_buf),
+        }
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        let thread = self
+            .thread
+            .as_ref()
+            .context("suspended runner thread handle is missing")?;
+        if unsafe { ResumeThread(thread.get()) } == u32::MAX {
+            anyhow::bail!("ResumeThread(runner) failed: {}", unsafe { GetLastError() });
+        }
+        self.thread.take();
+        Ok(())
+    }
+
+    fn into_lifetime(mut self, desktop_access: RunnerDesktopBootstrapAccess) -> RunnerLifetime {
+        self.terminate_on_drop = false;
+        let process = std::mem::replace(&mut self.process, OwnedWinHandle::new(0));
+        RunnerLifetime {
+            process,
+            desktop_access: Some(desktop_access),
+            log_dir: self.log_dir.take(),
+        }
+    }
+
+    fn terminate_and_wait(&self) -> Result<()> {
+        terminate_runner_and_wait(self.process.get(), RUNNER_TEARDOWN_TIMEOUT)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunnerTeardownReason {
+    ExitReceived,
+    TransportClosed,
+}
+
+pub(crate) struct RunnerLifetime {
+    process: OwnedWinHandle,
+    desktop_access: Option<RunnerDesktopBootstrapAccess>,
+    log_dir: Option<std::path::PathBuf>,
+}
+
+impl RunnerLifetime {
+    pub(crate) fn finish(mut self, reason: RunnerTeardownReason) -> Result<()> {
+        match reason {
+            RunnerTeardownReason::ExitReceived => {
+                let wait = unsafe {
+                    WaitForSingleObject(
+                        self.process.get(),
+                        u32::try_from(RUNNER_TEARDOWN_TIMEOUT.as_millis()).unwrap_or(u32::MAX),
+                    )
+                };
+                if wait == WAIT_TIMEOUT {
+                    terminate_runner_and_wait(self.process.get(), RUNNER_TEARDOWN_TIMEOUT)
+                        .context("runner remained alive after sending exit")?;
+                } else if wait != WAIT_OBJECT_0 {
+                    anyhow::bail!(
+                        "WaitForSingleObject failed for runner teardown: {}",
+                        unsafe { GetLastError() }
+                    );
+                }
+            }
+            RunnerTeardownReason::TransportClosed => {
+                terminate_runner_and_wait(self.process.get(), RUNNER_TEARDOWN_TIMEOUT)
+                    .context("terminate runner after transport closed")?;
+            }
+        }
+        self.desktop_access
+            .take()
+            .context("runner desktop access guard is missing")?
+            .revoke()
+            .context("remove runner desktop access after command completion")
+    }
+}
+
+impl Drop for RunnerLifetime {
+    fn drop(&mut self) {
+        if self.desktop_access.is_none() {
+            return;
+        }
+        if let Err(err) = terminate_runner_and_wait(self.process.get(), RUNNER_TEARDOWN_TIMEOUT) {
+            logging::debug_log(
+                &format!("failed to terminate runner while dropping desktop access: {err:#}"),
+                self.log_dir.as_deref(),
+            );
+            return;
+        }
+        if let Some(desktop_access) = self.desktop_access.take()
+            && let Err(err) = desktop_access.revoke()
+        {
+            logging::debug_log(
+                &format!("failed to remove runner desktop access during drop: {err:#}"),
+                self.log_dir.as_deref(),
+            );
+        }
+    }
+}
+
+impl Drop for PendingRunner {
+    fn drop(&mut self) {
+        if self.terminate_on_drop
+            && let Err(err) = self.terminate_and_wait()
+        {
+            logging::debug_log(
+                &format!("failed to terminate runner during startup cleanup: {err:#}"),
+                self.log_dir.as_deref(),
+            );
+        }
+    }
+}
+
+fn terminate_runner_and_wait(process: HANDLE, timeout: Duration) -> Result<()> {
+    let wait = unsafe { WaitForSingleObject(process, 0) };
+    if wait == WAIT_OBJECT_0 {
+        return Ok(());
+    }
+    if wait != WAIT_TIMEOUT {
+        anyhow::bail!(
+            "WaitForSingleObject failed before runner termination: {}",
+            unsafe { GetLastError() }
+        );
+    }
+    if unsafe {
+        TerminateProcess(process, /*uexitcode*/ 1)
+    } == 0
+    {
+        anyhow::bail!("TerminateProcess(runner) failed: {}", unsafe {
+            GetLastError()
+        });
+    }
+    let wait = unsafe {
+        WaitForSingleObject(
+            process,
+            u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
+        )
+    };
+    anyhow::ensure!(
+        wait == WAIT_OBJECT_0,
+        "runner did not exit after termination (wait result {wait})"
+    );
+    Ok(())
+}
+
 pub(crate) struct RunnerTransport {
     pipe_write: File,
     pipe_read: File,
+    lifetime: RunnerLifetime,
 }
 
 fn is_refreshable_windows_error(code: u32) -> bool {
@@ -171,8 +389,8 @@ impl RunnerTransport {
         }
     }
 
-    pub(crate) fn into_files(self) -> (File, File) {
-        (self.pipe_write, self.pipe_read)
+    pub(crate) fn into_parts(self) -> (File, File, RunnerLifetime) {
+        (self.pipe_write, self.pipe_read, self.lifetime)
     }
 }
 
@@ -200,7 +418,9 @@ fn try_take_completed_connect_result(
 fn connect_pipe_with_timeout(
     h_pipe: HANDLE,
     expected_runner_pid: u32,
+    runner_process: HANDLE,
     pipe_label: &str,
+    log_dir: Option<&Path>,
 ) -> Result<()> {
     let pipe_label = pipe_label.to_string();
     let pipe_label_for_thread = pipe_label.clone();
@@ -218,8 +438,8 @@ fn connect_pipe_with_timeout(
                         GetCurrentThread(),
                         current_process,
                         &mut thread_handle,
-                        0,
-                        0,
+                        /*dwdesiredaccess*/ 0,
+                        /*binherithandle*/ 0,
                         DUPLICATE_SAME_ACCESS,
                     )
                 };
@@ -245,60 +465,101 @@ fn connect_pipe_with_timeout(
         anyhow::anyhow!("runner {pipe_label} connect thread exited before publishing its handle")
     })??;
 
-    let result = match connect_result_rx.recv_timeout(RUNNER_PIPE_CONNECT_TIMEOUT) {
-        Ok(result) => {
-            if let Some(connect_thread) = connect_thread.take() {
-                let _ = connect_thread.join();
+    let deadline = Instant::now() + RUNNER_PIPE_CONNECT_TIMEOUT;
+    let result = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let poll_interval = remaining.min(RUNNER_PROCESS_POLL_INTERVAL);
+        match connect_result_rx.recv_timeout(poll_interval) {
+            Ok(result) => {
+                if let Some(connect_thread) = connect_thread.take() {
+                    let _ = connect_thread.join();
+                }
+                break result;
             }
-            result
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some(connect_thread) = connect_thread.take() {
+                    let _ = connect_thread.join();
+                }
+                break Err(anyhow::anyhow!(
+                    "runner {pipe_label} connect thread exited before reporting its result"
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            if let Some(result) = try_take_completed_connect_result(
-                &mut connect_thread,
-                &connect_result_rx,
-                thread_handle,
-                &pipe_label,
-            )? {
-                result
-            } else {
-                let cancel_ok = unsafe { CancelSynchronousIo(thread_handle) };
-                if cancel_ok == 0 {
-                    let err = unsafe { GetLastError() };
-                    if err != ERROR_NOT_FOUND {
-                        Err(anyhow::anyhow!(
-                            "CancelSynchronousIo failed for runner {pipe_label} connect thread: {err}"
-                        ))
-                    } else if let Some(result) = try_take_completed_connect_result(
-                        &mut connect_thread,
-                        &connect_result_rx,
-                        thread_handle,
-                        &pipe_label,
-                    )? {
-                        result
-                    } else {
-                        Err(anyhow::anyhow!(
-                            "timed out after {}ms connecting runner {pipe_label}",
-                            RUNNER_PIPE_CONNECT_TIMEOUT.as_millis()
-                        ))
-                    }
-                } else {
-                    // Do not join the helper thread on the timeout path. Parent-side cleanup will
-                    // close the pipe handles, which lets the blocked connect unwind without
-                    // risking another indefinite wait here.
-                    Err(anyhow::anyhow!(
-                        "timed out after {}ms connecting runner {pipe_label}",
-                        RUNNER_PIPE_CONNECT_TIMEOUT.as_millis()
-                    ))
+
+        let completed_connect = try_take_completed_connect_result(
+            &mut connect_thread,
+            &connect_result_rx,
+            thread_handle,
+            &pipe_label,
+        );
+        match completed_connect {
+            Ok(Some(result)) => break result,
+            Ok(None) => {}
+            Err(err) => break Err(err),
+        }
+
+        let process_wait = unsafe { WaitForSingleObject(runner_process, 0) };
+        if process_wait == WAIT_OBJECT_0 {
+            let exit_code = match runner_exit_code(runner_process) {
+                Ok(exit_code) => exit_code,
+                Err(err) => break Err(err),
+            };
+            runner_startup_diagnostic(
+                &format!(
+                    "runner pid={expected_runner_pid} exited before {pipe_label} connected; exit_code={}",
+                    format_exit_code(exit_code)
+                ),
+                log_dir,
+            );
+            let _ = unsafe { CancelSynchronousIo(thread_handle) };
+            break Err(anyhow::anyhow!(
+                "runner exited before connecting {pipe_label} with Windows process exit code {}",
+                format_exit_code(exit_code)
+            ));
+        }
+        if process_wait != WAIT_TIMEOUT {
+            break Err(anyhow::anyhow!(
+                "WaitForSingleObject failed while monitoring runner {pipe_label}: {}",
+                unsafe { GetLastError() }
+            ));
+        }
+
+        if Instant::now() >= deadline {
+            runner_startup_diagnostic(
+                &format!(
+                    "timed out after {}ms connecting {pipe_label}; runner pid={expected_runner_pid} alive=true",
+                    RUNNER_PIPE_CONNECT_TIMEOUT.as_millis()
+                ),
+                log_dir,
+            );
+            let cancel_ok = unsafe { CancelSynchronousIo(thread_handle) };
+            if cancel_ok == 0 {
+                let err = unsafe { GetLastError() };
+                if err != ERROR_NOT_FOUND {
+                    break Err(anyhow::anyhow!(
+                        "CancelSynchronousIo failed for runner {pipe_label} connect thread: {err}"
+                    ));
+                }
+                let completed_connect = try_take_completed_connect_result(
+                    &mut connect_thread,
+                    &connect_result_rx,
+                    thread_handle,
+                    &pipe_label,
+                );
+                match completed_connect {
+                    Ok(Some(result)) => break result,
+                    Ok(None) => {}
+                    Err(err) => break Err(err),
                 }
             }
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            if let Some(connect_thread) = connect_thread.take() {
-                let _ = connect_thread.join();
-            }
-            Err(anyhow::anyhow!(
-                "runner {pipe_label} connect thread exited before reporting its result"
-            ))
+            // Do not join the helper thread on the timeout path. Parent-side cleanup will close
+            // the pipe handle, which lets the blocked connect unwind without another indefinite
+            // wait here.
+            break Err(anyhow::anyhow!(
+                "timed out after {}ms connecting runner {pipe_label}; runner process was still alive",
+                RUNNER_PIPE_CONNECT_TIMEOUT.as_millis()
+            ));
         }
     };
 
@@ -320,11 +581,22 @@ pub(crate) fn spawn_runner_transport(
     spawn_request.private_desktop_name = desktop_policy
         .map(|policy| shared_private_desktop_for_user(&sandbox_creds.username, policy, log_dir))
         .transpose()?;
-    let (pipe_in_name, pipe_out_name) = pipe_pair();
-    let h_pipe_in =
-        create_named_pipe(&pipe_in_name, PIPE_ACCESS_OUTBOUND, &sandbox_creds.username)?;
-    let h_pipe_out =
-        create_named_pipe(&pipe_out_name, PIPE_ACCESS_INBOUND, &sandbox_creds.username)?;
+    let (startup_pipe_name, pipe_in_name, pipe_out_name) = pipe_set();
+    let startup_pipe = OwnedWinHandle::new(create_named_pipe(
+        &startup_pipe_name,
+        PIPE_ACCESS_INBOUND,
+        &sandbox_creds.username,
+    )?);
+    let pipe_in = OwnedWinHandle::new(create_named_pipe(
+        &pipe_in_name,
+        PIPE_ACCESS_OUTBOUND,
+        &sandbox_creds.username,
+    )?);
+    let pipe_out = OwnedWinHandle::new(create_named_pipe(
+        &pipe_out_name,
+        PIPE_ACCESS_INBOUND,
+        &sandbox_creds.username,
+    )?);
 
     let runner_exe = find_runner_exe(codex_home, log_dir);
     let runner_cmdline = runner_exe
@@ -332,8 +604,9 @@ pub(crate) fn spawn_runner_transport(
         .map(str::to_owned)
         .unwrap_or_else(|| "codex-command-runner.exe".to_string());
     let runner_full_cmd = format!(
-        "{} {} {}",
+        "{} {} {} {}",
         quote_windows_arg(&runner_cmdline),
+        quote_windows_arg(&format!("--startup-pipe={startup_pipe_name}")),
         quote_windows_arg(&format!("--pipe-in={pipe_in_name}")),
         quote_windows_arg(&format!("--pipe-out={pipe_out_name}"))
     );
@@ -348,6 +621,7 @@ pub(crate) fn spawn_runner_transport(
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let env_block: Option<Vec<u16>> = None;
 
+    let mut bootstrap_access = RunnerDesktopBootstrapAccess::new(log_dir);
     let previous_error_mode = unsafe { SetErrorMode(RUNNER_ERROR_MODE_FLAGS) };
     // Sandbox users have no profile state that commands should inherit.
     let spawn_res = unsafe {
@@ -358,8 +632,7 @@ pub(crate) fn spawn_runner_transport(
             /*dwlogonflags*/ 0,
             exe_w.as_ptr(),
             cmdline_vec.as_mut_ptr(),
-            windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
-                | windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT,
+            CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
             env_block
                 .as_ref()
                 .map(|block| block.as_ptr() as *const c_void)
@@ -369,79 +642,57 @@ pub(crate) fn spawn_runner_transport(
             &mut pi,
         )
     };
+    let spawn_error = (spawn_res == 0).then(|| unsafe { GetLastError() });
     unsafe {
         SetErrorMode(previous_error_mode);
     }
-    if spawn_res == 0 {
-        let err = unsafe { GetLastError() };
-        unsafe {
-            CloseHandle(h_pipe_in);
-            CloseHandle(h_pipe_out);
-        }
+    if let Some(err) = spawn_error {
         return Err(RunnerLogonError { code: err }.into());
     }
-    let expected_runner_pid = pi.dwProcessId;
+    let mut runner = PendingRunner::new(pi, log_dir);
+    bootstrap_access
+        .grant_child_logon_sid(runner.process.get())
+        .context("grant suspended runner logon-SID desktop access")?;
+    runner.resume()?;
+    let expected_runner_pid = runner.pid;
+    // From this point onward, every error path must stop the running helper before revoking the
+    // logon-SID access that it and its restricted command child share.
+    let lifetime = runner.into_lifetime(bootstrap_access);
 
-    let connect_result = (|| -> Result<()> {
-        connect_pipe_with_timeout(h_pipe_in, expected_runner_pid, "pipe-in")?;
-        connect_pipe_with_timeout(h_pipe_out, expected_runner_pid, "pipe-out")?;
-        Ok(())
-    })();
+    connect_pipe_with_timeout(
+        startup_pipe.get(),
+        expected_runner_pid,
+        lifetime.process.get(),
+        "startup-marker",
+        log_dir,
+    )?;
+    drop(startup_pipe);
+    connect_pipe_with_timeout(
+        pipe_in.get(),
+        expected_runner_pid,
+        lifetime.process.get(),
+        "pipe-in",
+        log_dir,
+    )?;
+    connect_pipe_with_timeout(
+        pipe_out.get(),
+        expected_runner_pid,
+        lifetime.process.get(),
+        "pipe-out",
+        log_dir,
+    )?;
 
-    unsafe {
-        if pi.hThread != 0 {
-            CloseHandle(pi.hThread);
-        }
-    }
-
-    if let Err(err) = connect_result {
-        unsafe {
-            // Keep the process handle alive until the pipe handshake finishes. If the handshake
-            // fails after the runner process has already launched, we still need a way to stop
-            // that child instead of leaking a stray `codex-command-runner.exe`.
-            if pi.hProcess != 0 {
-                let _ = TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hProcess);
-            }
-            CloseHandle(h_pipe_in);
-            CloseHandle(h_pipe_out);
-        }
-        return Err(err);
-    }
-
+    let pipe_write = unsafe { File::from_raw_handle(pipe_in.into_raw() as _) };
+    let pipe_read = unsafe { File::from_raw_handle(pipe_out.into_raw() as _) };
     let mut transport = RunnerTransport {
         // Once the pipe connect phase succeeds we can transfer the raw HANDLEs into `File`s.
         // From here on, the `RunnerTransport` owns closing the pipes on every success/error path.
-        pipe_write: unsafe { File::from_raw_handle(h_pipe_in as _) },
-        pipe_read: unsafe { File::from_raw_handle(h_pipe_out as _) },
+        pipe_write,
+        pipe_read,
+        lifetime,
     };
-    let startup_result = (|| -> Result<()> {
-        // Keep the runner process HANDLE alive until the *entire* startup handshake finishes.
-        // That way, a later `send_spawn_request` or `spawn_ready` failure can still terminate the
-        // runner instead of leaving a stray `codex-command-runner.exe` behind.
-        transport.send_spawn_request(spawn_request)?;
-        transport.read_spawn_ready()?;
-        Ok(())
-    })();
-    if let Err(err) = startup_result {
-        unsafe {
-            if pi.hProcess != 0 {
-                let _ = TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hProcess);
-            }
-        }
-        drop(transport);
-        return Err(err);
-    }
-
-    unsafe {
-        if pi.hProcess != 0 {
-            // The runner has now connected both pipes *and* acknowledged the spawn request, so
-            // startup is complete. At that point the transport pipes become the only lifetime
-            // anchor we need to keep the session alive.
-            CloseHandle(pi.hProcess);
-        }
-    }
+    transport.send_spawn_request(spawn_request)?;
+    transport.read_spawn_ready()?;
 
     Ok(transport)
 }
@@ -496,10 +747,16 @@ fn wait_for_complete_frame(pipe_read: &File, timeout: Duration) -> Result<()> {
 mod tests {
     use super::RunnerLogonError;
     use super::RunnerStartupError;
+    use super::connect_pipe_with_timeout;
     use super::is_refreshable_sandbox_creds_error;
     use crate::ipc_framed::ErrorPayload;
     use crate::ipc_framed::ErrorStage;
+    use crate::runner_pipe::PIPE_ACCESS_INBOUND;
+    use crate::runner_pipe::create_named_pipe;
     use pretty_assertions::assert_eq;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Command;
+    use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::Foundation::ERROR_LOGON_FAILURE;
     use windows_sys::Win32::Foundation::ERROR_NO_SUCH_LOGON_SESSION;
     use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
@@ -557,5 +814,33 @@ mod tests {
             }),
             [false, false]
         );
+    }
+
+    #[test]
+    fn pipe_connect_reports_runner_exit_code_without_waiting_for_timeout() -> anyhow::Result<()> {
+        let username = std::env::var("USERNAME")?;
+        let pipe_name = format!(r"\\.\pipe\codex-runner-exit-test-{}", std::process::id());
+        let pipe = create_named_pipe(&pipe_name, PIPE_ACCESS_INBOUND, &username)?;
+        let mut child = Command::new("cmd.exe")
+            .args(["/d", "/c", "exit", "66"])
+            .spawn()?;
+
+        let result = connect_pipe_with_timeout(
+            pipe,
+            child.id(),
+            child.as_raw_handle() as _,
+            "test-pipe",
+            None,
+        );
+        unsafe {
+            CloseHandle(pipe);
+        }
+        let _ = child.wait();
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "runner exited before connecting test-pipe with Windows process exit code 0x00000042 (66)"
+        );
+        Ok(())
     }
 }

@@ -61,6 +61,8 @@ mod deny_read_state;
 #[cfg(target_os = "windows")]
 mod desktop;
 #[cfg(target_os = "windows")]
+mod desktop_bootstrap;
+#[cfg(target_os = "windows")]
 mod dpapi;
 #[cfg(target_os = "windows")]
 mod env;
