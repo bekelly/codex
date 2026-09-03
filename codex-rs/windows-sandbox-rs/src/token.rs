@@ -45,6 +45,7 @@ const WRITE_RESTRICTED: u32 = 0x08;
 const GENERIC_ALL: u32 = 0x1000_0000;
 const WIN_WORLD_SID: i32 = 1;
 const SE_GROUP_LOGON_ID: u32 = 0xC0000000;
+const SE_GROUP_ENABLED: u32 = 0x00000004;
 
 #[repr(C)]
 struct TokenDefaultDaclInfo {
@@ -327,6 +328,21 @@ pub unsafe fn get_logon_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>> {
     }
 
     Err(anyhow!("Logon SID not present on token"))
+}
+
+/// Returns the enabled logon SID directly present on `h_token`.
+///
+/// Unlike [`get_logon_sid_bytes`], this does not inspect a linked token: callers that use this
+/// for window-object ACLs need the SID that is enabled on the exact primary token being launched.
+pub(crate) unsafe fn get_enabled_logon_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>> {
+    token_groups(h_token, u32::MAX)?
+        .into_iter()
+        .find(|group| {
+            group.attributes & SE_GROUP_LOGON_ID == SE_GROUP_LOGON_ID
+                && group.attributes & SE_GROUP_ENABLED != 0
+        })
+        .map(|group| group.sid)
+        .ok_or_else(|| anyhow!("enabled logon SID not present on token"))
 }
 
 pub(crate) use crate::token_user::get_user_sid_bytes;

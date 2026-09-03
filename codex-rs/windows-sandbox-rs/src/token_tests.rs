@@ -1,4 +1,5 @@
 use super::*;
+use pretty_assertions::assert_eq;
 use windows_sys::Win32::Security::EqualSid;
 use windows_sys::Win32::Security::TokenRestrictedSids;
 
@@ -65,5 +66,23 @@ fn elevated_token_includes_network_proxy_restricting_sid() -> Result<()> {
     }
 
     assert!(has_network_proxy_sid?);
+    Ok(())
+}
+
+#[test]
+fn elevated_restricted_token_preserves_enabled_logon_sid() -> Result<()> {
+    let capability_sid = LocalSid::from_string("S-1-5-21-10-20-30-40")?;
+    let base_token = unsafe { get_current_token_for_restriction()? };
+    let base_logon_sid = unsafe { get_enabled_logon_sid_bytes(base_token)? };
+    let restricted_token = unsafe {
+        create_readonly_token_with_caps_and_user_from(base_token, &[capability_sid.as_ptr()], &[])?
+    };
+    let restricted_logon_sid = unsafe { get_enabled_logon_sid_bytes(restricted_token) };
+    unsafe {
+        CloseHandle(restricted_token);
+        CloseHandle(base_token);
+    }
+
+    assert_eq!(restricted_logon_sid?, base_logon_sid);
     Ok(())
 }
