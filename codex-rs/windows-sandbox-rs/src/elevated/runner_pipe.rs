@@ -42,12 +42,16 @@ pub fn find_runner_exe(codex_home: &Path, log_dir: Option<&Path>) -> anyhow::Res
     resolve_command_runner(codex_home, log_dir)
 }
 
-/// Generates a unique named-pipe path used to communicate with the runner process.
-pub fn pipe_pair() -> (String, String) {
+/// Generates unique named-pipe paths used to observe runner startup and exchange IPC.
+pub fn pipe_set() -> (String, String, String) {
     let mut rng = SmallRng::from_entropy();
     let nonce: u128 = rng.r#gen();
     let base = format!(r"\\.\pipe\codex-runner-{nonce:x}");
-    (format!("{base}-in"), format!("{base}-out"))
+    (
+        format!("{base}-startup"),
+        format!("{base}-in"),
+        format!("{base}-out"),
+    )
 }
 
 /// Creates a named pipe whose DACL only allows the sandbox user to connect.

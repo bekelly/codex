@@ -540,16 +540,22 @@ fn spawn_input_loop(
 
 /// Entry point for the Windows command runner process.
 pub fn main() -> Result<()> {
+    let mut startup_pipe = None;
     let mut pipe_in = None;
     let mut pipe_out = None;
     for arg in std::env::args().skip(1) {
-        if let Some(rest) = arg.strip_prefix("--pipe-in=") {
+        if let Some(rest) = arg.strip_prefix("--startup-pipe=") {
+            startup_pipe = Some(rest.to_string());
+        } else if let Some(rest) = arg.strip_prefix("--pipe-in=") {
             pipe_in = Some(rest.to_string());
         } else if let Some(rest) = arg.strip_prefix("--pipe-out=") {
             pipe_out = Some(rest.to_string());
         }
     }
 
+    let Some(startup_pipe) = startup_pipe else {
+        anyhow::bail!("runner: no startup pipe provided");
+    };
     let Some(pipe_in) = pipe_in else {
         anyhow::bail!("runner: no pipe-in provided");
     };
@@ -557,11 +563,20 @@ pub fn main() -> Result<()> {
         anyhow::bail!("runner: no pipe-out provided");
     };
 
-    // Open both pipe ends under guards first so a failure on the second open cannot leak the
-    // first HANDLE. Only after both opens succeed do we transfer ownership into `File`, which
-    // then becomes responsible for closing them.
+    // Connecting this marker is the first substantive action after argument parsing. The parent
+    // uses it to distinguish process-loader/CRT failures from failures after Rust main starts.
+    // Hold it open until both transport pipes connect so the parent cannot miss a short-lived
+    // marker connection.
+    let startup_marker = OwnedWinHandle::new(
+        open_pipe(&startup_pipe, FILE_GENERIC_WRITE).context("runner: open startup marker pipe")?,
+    );
+
+    // Open both transport pipe ends under guards first so a failure on the second open cannot
+    // leak the first HANDLE. Only after both opens succeed do we transfer ownership into `File`,
+    // which then becomes responsible for closing them.
     let h_pipe_in = OwnedWinHandle::new(open_pipe(&pipe_in, FILE_GENERIC_READ)?);
     let h_pipe_out = OwnedWinHandle::new(open_pipe(&pipe_out, FILE_GENERIC_WRITE)?);
+    drop(startup_marker);
     let mut pipe_read = unsafe { File::from_raw_handle(h_pipe_in.into_raw() as _) };
     let pipe_write = Arc::new(StdMutex::new(unsafe {
         File::from_raw_handle(h_pipe_out.into_raw() as _)
