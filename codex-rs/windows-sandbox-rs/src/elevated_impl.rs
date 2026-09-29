@@ -44,6 +44,7 @@ mod windows_impl {
     use crate::logging::log_start;
     use crate::logging::log_success;
     use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
+    use crate::runner_client::RunnerTeardownReason;
     use crate::runner_client::retry_runner_spawn_once;
     use crate::runner_client::spawn_runner_transport;
     use crate::sandbox_utils::ensure_codex_home_exists;
@@ -244,11 +245,12 @@ mod windows_impl {
                     )
                 },
             )?;
-            let (pipe_write, mut pipe_read) = transport.into_files();
+            let (pipe_write, mut pipe_read, runner_lifetime) = transport.into_parts();
             let cancel_writer = spawn_cancel_writer(&pipe_write, cancellation)?;
 
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
+            let mut teardown_reason = RunnerTeardownReason::TransportClosed;
             let result = loop {
                 let msg = match read_frame(&mut pipe_read) {
                     Ok(Some(msg)) => msg,
@@ -266,7 +268,10 @@ mod windows_impl {
                             break Err(err);
                         }
                     },
-                    Message::Exit { payload } => break Ok((payload.exit_code, payload.timed_out)),
+                    Message::Exit { payload } => {
+                        teardown_reason = RunnerTeardownReason::ExitReceived;
+                        break Ok((payload.exit_code, payload.timed_out));
+                    }
                     Message::Error { payload } => {
                         break Err(anyhow::anyhow!("runner error: {}", payload.message));
                     }
@@ -283,8 +288,24 @@ mod windows_impl {
                 let _ = cancel_handle.join();
             }
             drop(pipe_write);
-            crate::elevated::runner_metrics::record_command(result.as_ref().ok().copied());
-            let (exit_code, timed_out) = result?;
+            let cleanup_result = runner_lifetime.finish(teardown_reason);
+            crate::elevated::runner_metrics::record_command(if cleanup_result.is_ok() {
+                result.as_ref().ok().copied()
+            } else {
+                None
+            });
+            let (exit_code, timed_out) = match (result, cleanup_result) {
+                (Ok(result), Ok(())) => result,
+                (Err(command_err), Ok(())) => return Err(command_err),
+                (Ok(_), Err(cleanup_err)) => {
+                    return Err(cleanup_err.context("runner authority cleanup failed"));
+                }
+                (Err(command_err), Err(cleanup_err)) => {
+                    return Err(anyhow::anyhow!(
+                        "{command_err:#}; runner authority cleanup also failed: {cleanup_err:#}"
+                    ));
+                }
+            };
 
             if exit_code == 0 {
                 log_success(&command, logs_base_dir);
