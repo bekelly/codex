@@ -7,6 +7,7 @@ use crate::ipc_framed::ResizePayload;
 use crate::ipc_framed::StdinPayload;
 use crate::ipc_framed::decode_bytes;
 use crate::ipc_framed::encode_bytes;
+use crate::runner_client::RunnerTeardownReason;
 use anyhow::Result;
 use codex_utils_pty::ProcessDriver;
 use codex_utils_pty::SpawnedProcess;
@@ -82,9 +83,12 @@ pub(crate) fn start_runner_stdout_reader(
     stdout_tx: broadcast::Sender<Vec<u8>>,
     stderr_tx: Option<broadcast::Sender<Vec<u8>>>,
     exit_tx: oneshot::Sender<i32>,
+    teardown: impl FnOnce(RunnerTeardownReason) -> Result<()> + Send + 'static,
 ) {
     std::thread::spawn(move || {
-        let exit = loop {
+        let mut exit = None;
+        let mut teardown_reason = RunnerTeardownReason::TransportClosed;
+        loop {
             let msg = match crate::ipc_framed::read_frame(&mut pipe_read) {
                 Ok(Some(v)) => v,
                 Ok(None) => {
@@ -93,7 +97,7 @@ pub(crate) fn start_runner_stdout_reader(
                         &stdout_tx,
                         stderr_tx.as_ref(),
                     );
-                    break None;
+                    break;
                 }
                 Err(err) => {
                     send_runner_error(
@@ -101,7 +105,7 @@ pub(crate) fn start_runner_stdout_reader(
                         &stdout_tx,
                         stderr_tx.as_ref(),
                     );
-                    break None;
+                    break;
                 }
             };
 
@@ -123,11 +127,13 @@ pub(crate) fn start_runner_stdout_reader(
                     }
                 }
                 Message::Exit { payload } => {
-                    break Some((payload.exit_code, payload.timed_out));
+                    exit = Some((payload.exit_code, payload.timed_out));
+                    teardown_reason = RunnerTeardownReason::ExitReceived;
+                    break;
                 }
                 Message::Error { payload } => {
                     send_runner_error(&payload.message, &stdout_tx, stderr_tx.as_ref());
-                    break None;
+                    break;
                 }
                 Message::SpawnReady { .. }
                 | Message::Stdin { .. }
@@ -136,9 +142,25 @@ pub(crate) fn start_runner_stdout_reader(
                 | Message::SpawnRequest { .. }
                 | Message::Terminate { .. } => {}
             }
+        }
+        let cleanup_result = teardown(teardown_reason);
+        crate::elevated::runner_metrics::record_command(if cleanup_result.is_ok() {
+            exit
+        } else {
+            None
+        });
+        let exit_code = match cleanup_result {
+            Ok(()) => exit.map_or(-1, |(code, _)| code),
+            Err(err) => {
+                send_runner_error(
+                    &format!("runner authority cleanup failed: {err:#}"),
+                    &stdout_tx,
+                    stderr_tx.as_ref(),
+                );
+                -1
+            }
         };
-        crate::elevated::runner_metrics::record_command(exit);
-        let _ = exit_tx.send(exit.map_or(-1, |(code, _)| code));
+        let _ = exit_tx.send(exit_code);
     });
 }
 
