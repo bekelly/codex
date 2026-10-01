@@ -27,7 +27,13 @@ fn runner_result_reporting_preserves_exit_and_closed_pipe_results() -> Result<()
         frames.rewind()?;
         let (stdout_tx, _stdout_rx) = broadcast::channel(1);
         let (exit_tx, exit_rx) = oneshot::channel();
-        start_runner_stdout_reader(frames, stdout_tx, /*stderr_tx*/ None, exit_tx);
+        start_runner_stdout_reader(
+            frames,
+            stdout_tx,
+            /*stderr_tx*/ None,
+            exit_tx,
+            |_| Ok(()),
+        );
         assert_eq!(exit_rx.blocking_recv()?, exit_code.unwrap_or(-1));
     }
     Ok(())

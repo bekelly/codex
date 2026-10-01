@@ -37,6 +37,7 @@ use windows_sys::Win32::Security::TOKEN_PRIVILEGES;
 use windows_sys::Win32::Security::TOKEN_QUERY;
 use windows_sys::Win32::Security::TokenDefaultDacl;
 use windows_sys::Win32::Security::TokenGroups;
+use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 const DISABLE_MAX_PRIVILEGE: u32 = 0x01;
@@ -332,6 +333,19 @@ pub unsafe fn get_logon_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>> {
     }
 
     Err(anyhow!("Logon SID not present on token"))
+}
+
+/// Return the enabled logon SID on this exact token for temporary window-object grants.
+/// The linked-token fallback in get_logon_sid_bytes is unsuitable for the child token.
+pub(crate) unsafe fn get_enabled_logon_sid_bytes(token: HANDLE) -> Result<Vec<u8>> {
+    token_groups(token, u32::MAX)?
+        .into_iter()
+        .find(|group| {
+            group.attributes & SE_GROUP_LOGON_ID == SE_GROUP_LOGON_ID
+                && group.attributes & SE_GROUP_ENABLED as u32 != 0
+        })
+        .map(|group| group.sid)
+        .ok_or_else(|| anyhow!("enabled logon SID not present on token"))
 }
 
 pub(crate) use crate::token_user::get_user_sid_bytes;

@@ -229,3 +229,20 @@ fn default_objects_deny_other_logons_even_with_the_same_owner() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn elevated_restricted_token_preserves_enabled_logon_sid() -> Result<()> {
+    let capability_sid = LocalSid::from_string("S-1-5-21-10-20-30-40")?;
+    let base_token = unsafe { get_current_token_for_restriction()? };
+    let base_logon_sid = unsafe { get_enabled_logon_sid_bytes(base_token)? };
+    let restricted_token = unsafe {
+        create_readonly_token_with_caps_and_user_from(base_token, &[capability_sid.as_ptr()], &[])?
+    };
+    let restricted_logon_sid = unsafe { get_enabled_logon_sid_bytes(restricted_token) };
+    unsafe {
+        CloseHandle(restricted_token);
+        CloseHandle(base_token);
+    }
+    assert_eq!(restricted_logon_sid?, base_logon_sid);
+    Ok(())
+}

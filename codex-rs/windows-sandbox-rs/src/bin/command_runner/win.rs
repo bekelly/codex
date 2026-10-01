@@ -13,6 +13,8 @@ mod cwd_junction;
 #[cfg(test)]
 #[path = "win/input_loop_tests.rs"]
 mod input_loop_tests;
+#[path = "win/startup.rs"]
+mod startup;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -51,7 +53,6 @@ use codex_windows_sandbox::token_mode_for_permission_profile;
 use codex_windows_sandbox::write_frame;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::path::PathBuf;
 use std::ptr;
@@ -63,8 +64,6 @@ use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Storage::FileSystem::CreateFileW;
-use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
-use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
 use windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING;
 use windows_sys::Win32::System::Console::COORD;
 use windows_sys::Win32::System::Console::ResizePseudoConsole;
@@ -540,16 +539,22 @@ fn spawn_input_loop(
 
 /// Entry point for the Windows command runner process.
 pub fn main() -> Result<()> {
+    let mut startup_pipe = None;
     let mut pipe_in = None;
     let mut pipe_out = None;
     for arg in std::env::args().skip(1) {
-        if let Some(rest) = arg.strip_prefix("--pipe-in=") {
+        if let Some(rest) = arg.strip_prefix("--startup-pipe=") {
+            startup_pipe = Some(rest.to_string());
+        } else if let Some(rest) = arg.strip_prefix("--pipe-in=") {
             pipe_in = Some(rest.to_string());
         } else if let Some(rest) = arg.strip_prefix("--pipe-out=") {
             pipe_out = Some(rest.to_string());
         }
     }
 
+    let Some(startup_pipe) = startup_pipe else {
+        anyhow::bail!("runner: no startup pipe provided");
+    };
     let Some(pipe_in) = pipe_in else {
         anyhow::bail!("runner: no pipe-in provided");
     };
@@ -557,28 +562,8 @@ pub fn main() -> Result<()> {
         anyhow::bail!("runner: no pipe-out provided");
     };
 
-    // Open both pipe ends under guards first so a failure on the second open cannot leak the
-    // first HANDLE. Only after both opens succeed do we transfer ownership into `File`, which
-    // then becomes responsible for closing them.
-    let h_pipe_in = OwnedWinHandle::new(open_pipe(&pipe_in, FILE_GENERIC_READ)?);
-    let h_pipe_out = OwnedWinHandle::new(open_pipe(&pipe_out, FILE_GENERIC_WRITE)?);
-    let mut pipe_read = unsafe { File::from_raw_handle(h_pipe_in.into_raw() as _) };
-    let pipe_write = Arc::new(StdMutex::new(unsafe {
-        File::from_raw_handle(h_pipe_out.into_raw() as _)
-    }));
-
-    let req = match read_spawn_request(&mut pipe_read) {
-        Ok(v) => v,
-        Err(err) => {
-            let _ = send_error(
-                &pipe_write,
-                ErrorStage::ReadSpawnRequest,
-                /*windows_error_code*/ None,
-                err.to_string(),
-            );
-            return Err(err);
-        }
-    };
+    let (pipe_read, pipe_write, req) =
+        startup::connect_and_read_spawn_request(&startup_pipe, &pipe_in, &pipe_out)?;
 
     let ipc_spawn = match spawn_ipc_process(&req) {
         Ok(value) => value,
