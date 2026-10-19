@@ -318,3 +318,7 @@ Tests and features must support Linux, macOS and Windows unless feature is expli
 
 Codex supports running connected app-server and exec-server on different operating systems. See the
 `$remote-tests` skill for details about integration testing these configurations.
+
+## Bayshore Labs version convention
+
+For future Bayshore-owned canonical artifacts use yy.Mdd.i.b (26.1019.3.241): two-digit year, unpadded month plus two-digit day, per-product daily sequence starting at 1, and increasing lifetime build counter preserving its existing baseline. Allocate atomically using America/New_York including DST; never reuse failed or ambiguous allocations. Allocated versions and historical releases are immutable. The complete shared specification is Harbor docs/BAYSHORE-VERSIONING.md and published company policy revision 7. Native Windows/Apple fields need separately validated immutable mappings; no Apple mapping is execution-validated. This documentation change does not authorize pipeline, tooling, installer, application-version, deployment, Music, or runtime changes. Upstream/external versions retain their own identity.
